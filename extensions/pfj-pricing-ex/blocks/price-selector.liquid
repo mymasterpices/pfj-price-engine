@@ -3,17 +3,16 @@
   PFJ Price Selector — Theme App Extension Block
   extensions/pfj-theme-ext/blocks/price-selector.liquid
 
-  How it works:
-  1. Reads rates from Shop Metafields (set by the admin app) — zero API lag
-  2. Renders metal + diamond dropdowns
-  3. Shows a live updated total price
-  4. Injects hidden <input> fields into the theme's existing product form
-  5. The theme's native "Add to cart" button submits everything — no custom button
-  6. Cart Transform Function reads _surcharge and locks the real price at checkout
+  FIXES IN THIS VERSION:
+  1. _surcharge only set when user has made a selection (not on base-only load)
+  2. Intercepts theme's ATC button click → ensures _surcharge is current
+  3. Also intercepts Ajax fetch('/cart/add.js') if theme uses drawer cart
+  4. _surcharge = surcharge ONLY in cents (not total) — cart_transform adds it
+     to the variant's own price server-side
   ============================================================================
 {% endcomment %}
 
-{% comment %} ── Read rates from Shop Metafields — stored as dollars, convert to cents ── {% endcomment %}
+{% comment %} ── Rates from Shop Metafields → cents ── {% endcomment %}
 {% assign mf    = shop.metafields.pfj_pricing %}
 {% assign r_18k = mf.gold_18k.value | default: 0 | times: 100 | round %}
 {% assign r_14k = mf.gold_14k.value | default: 0 | times: 100 | round %}
@@ -21,18 +20,20 @@
 {% assign r_nat = mf.dia_nat.value  | default: 0 | times: 100 | round %}
 {% assign r_lab = mf.dia_lab.value  | default: 0 | times: 100 | round %}
 
-{% comment %} ── Unique ID so multiple blocks on one page don't collide ── {% endcomment %}
-{% assign uid = block.id | remove: '-' | slice: 0, 10 %}
+{% assign shop_currency     = shop.currency %}
+{% assign shop_money_format = shop.money_format %}
+{% assign uid               = block.id | remove: '-' | slice: 0, 10 %}
 
 <div
   id="pfj-{{ uid }}"
   class="pfj-selector"
   data-uid="{{ uid }}"
   data-base-price="{{ product.selected_or_first_available_variant.price }}"
+  data-currency="{{ shop_currency }}"
+  data-money-format="{{ shop_money_format | escape }}"
   {{ block.shopify_attributes }}
 >
 
-  {% comment %} ─── Metal dropdown ──────────────────────────────────────── {% endcomment %}
   {% if block.settings.show_metal %}
   <div class="pfj-field">
     <label class="pfj-label" for="pfj-metal-{{ uid }}">
@@ -55,7 +56,6 @@
   </div>
   {% endif %}
 
-  {% comment %} ─── Diamond dropdown ─────────────────────────────────────── {% endcomment %}
   {% if block.settings.show_diamond %}
   <div class="pfj-field">
     <label class="pfj-label" for="pfj-diamond-{{ uid }}">
@@ -75,7 +75,6 @@
   </div>
   {% endif %}
 
-  {% comment %} ─── Price display ────────────────────────────────────────── {% endcomment %}
   <div class="pfj-price-row">
     <span class="pfj-price-label">
       {{ block.settings.price_label | default: 'Total price' }}
@@ -85,7 +84,6 @@
     </span>
   </div>
 
-  {% comment %} ─── Breakdown (hidden until surcharge > 0) ─────────────── {% endcomment %}
   <div class="pfj-breakdown" id="pfj-breakdown-{{ uid }}" hidden>
     <span>Base: <strong id="pfj-base-{{ uid }}"></strong></span>
     <span>+ surcharge: <strong id="pfj-sur-{{ uid }}"></strong></span>
@@ -95,8 +93,7 @@
 
 <style>
 .pfj-selector { margin: 12px 0; }
-
-.pfj-field { margin-bottom: 14px; }
+.pfj-field    { margin-bottom: 14px; }
 
 .pfj-label {
   display: block;
@@ -108,7 +105,6 @@
 }
 
 .pfj-select-wrap { position: relative; }
-
 .pfj-select-wrap::after {
   content: '';
   position: absolute;
@@ -137,7 +133,6 @@
   transition: border-color .15s;
   line-height: 1.5;
 }
-
 .pfj-select:focus {
   outline: .2rem solid rgba(var(--color-foreground, 18 18 18), .45);
   outline-offset: .3rem;
@@ -152,19 +147,16 @@
   border-top: .1rem solid rgba(var(--color-foreground, 18 18 18), .08);
   margin-top: 4px;
 }
-
 .pfj-price-label {
   font-size: .875rem;
   color: rgba(var(--color-foreground, 18 18 18), .7);
 }
-
 .pfj-price-value {
   font-size: 1.3rem;
   font-weight: 700;
   color: rgb(var(--color-foreground, 18 18 18));
   transition: color .15s;
 }
-
 .pfj-breakdown {
   display: flex;
   gap: 1.2rem;
@@ -172,7 +164,6 @@
   color: rgba(var(--color-foreground, 18 18 18), .55);
   padding-bottom: 8px;
 }
-
 .pfj-breakdown[hidden] { display: none; }
 </style>
 
@@ -180,31 +171,45 @@
 (function () {
   'use strict';
 
-  var UID      = {{ uid | json }};
-  var block    = document.getElementById('pfj-' + UID);
-  if (!block) return;
+  var UID        = {{ uid | json }};
+  var blockEl    = document.getElementById('pfj-' + UID);
+  if (!blockEl) return;
 
-  var metalSel = block.querySelector('[data-pfj="metal"]');
-  var diaSel   = block.querySelector('[data-pfj="diamond"]');
-  var priceEl  = document.getElementById('pfj-price-'     + UID);
-  var brkEl    = document.getElementById('pfj-breakdown-' + UID);
-  var baseEl   = document.getElementById('pfj-base-'      + UID);
-  var surEl    = document.getElementById('pfj-sur-'       + UID);
+  var metalSel   = blockEl.querySelector('[data-pfj="metal"]');
+  var diaSel     = blockEl.querySelector('[data-pfj="diamond"]');
+  var priceEl    = document.getElementById('pfj-price-'     + UID);
+  var brkEl      = document.getElementById('pfj-breakdown-' + UID);
+  var baseEl     = document.getElementById('pfj-base-'      + UID);
+  var surEl      = document.getElementById('pfj-sur-'       + UID);
 
-  // Base price in cents (Shopify always outputs price in cents)
-  var basePrice = parseInt(block.dataset.basePrice, 10) || 0;
+  var basePrice  = parseInt(blockEl.dataset.basePrice, 10) || 0;
+  var currency   = blockEl.dataset.currency   || 'INR';
+  var moneyFmt   = blockEl.dataset.moneyFormat || '&#x20B9;{{amount}}';
 
-  // ── Money formatter ──────────────────────────────────────────────────────
+  // ── Formatter ─────────────────────────────────────────────────────────────
   function money(cents) {
     if (window.Shopify && window.Shopify.formatMoney) {
-      return window.Shopify.formatMoney(cents, '{{ shop.money_format | escape_once }}');
+      return window.Shopify.formatMoney(cents, moneyFmt);
     }
-    return '$' + (cents / 100).toFixed(2);
+    var amt = (cents / 100).toFixed(2);
+    return moneyFmt
+      .replace('{{amount}}', amt)
+      .replace('{{amount_no_decimals}}', Math.round(cents / 100))
+      .replace('{{amount_with_comma_separator}}', amt);
   }
 
-  // ── Find the theme's product form ────────────────────────────────────────
+  // ── Current surcharge in cents ─────────────────────────────────────────────
+  // KEY FIX: _surcharge = SURCHARGE ONLY (not total)
+  // cart_transform reads the variant's own price + adds this surcharge
+  function getSurchargeCents() {
+    var m = parseInt(metalSel ? metalSel.value : 0, 10) || 0;
+    var d = parseInt(diaSel   ? diaSel.value   : 0, 10) || 0;
+    return m + d;
+  }
+
+  // ── Find product form ──────────────────────────────────────────────────────
   function getForm() {
-    var el = block.parentElement;
+    var el = blockEl.parentElement;
     while (el && el !== document.body) {
       var f = el.querySelector('form[action*="/cart/add"]');
       if (f) return f;
@@ -213,30 +218,45 @@
     return document.querySelector('form[action*="/cart/add"]');
   }
 
-  // ── Ensure a hidden input exists in the form ─────────────────────────────
-  function hiddenInput(form, name) {
-    var sel = 'input[name="' + name + '"]';
-    var inp = form.querySelector(sel);
+  // ── Ensure hidden input ────────────────────────────────────────────────────
+  function setHidden(form, name, value) {
+    var inp = form.querySelector('input[name="' + name + '"]');
     if (!inp) {
-      inp = document.createElement('input');
+      inp      = document.createElement('input');
       inp.type = 'hidden';
       inp.name = name;
       form.appendChild(inp);
     }
+    inp.value = value;
     return inp;
   }
 
-  // ── Recalculate and sync ─────────────────────────────────────────────────
-  function update() {
-    var mCents = parseInt(metalSel ? metalSel.value : 0, 10) || 0;
-    var dCents = parseInt(diaSel   ? diaSel.value   : 0, 10) || 0;
-    var sur    = mCents + dCents;
-    var total  = basePrice + sur;
+  // ── Sync hidden inputs ─────────────────────────────────────────────────────
+  function syncForm() {
+    var form = getForm();
+    if (!form) return;
 
-    // Update visible price display
+    var sur    = getSurchargeCents();
+    var mLabel = metalSel ? metalSel.options[metalSel.selectedIndex].dataset.label : 'Standard';
+    var dLabel = diaSel   ? diaSel.options[diaSel.selectedIndex].dataset.label     : 'No Diamond';
+
+    setHidden(form, 'properties[Metal]',          mLabel);
+    setHidden(form, 'properties[Diamond]',         dLabel);
+
+    // ── KEY: _surcharge = SURCHARGE CENTS ONLY ────────────────────────────
+    // cart_transform_run.js reads variant cost from Shopify + adds this
+    // DO NOT send total — that would double-count the base price
+    setHidden(form, 'properties[_surcharge]',      sur);
+    setHidden(form, 'properties[_currency]',       currency);
+  }
+
+  // ── Update price display ───────────────────────────────────────────────────
+  function updateDisplay() {
+    var sur   = getSurchargeCents();
+    var total = basePrice + sur;
+
     if (priceEl) priceEl.textContent = money(total);
 
-    // Show/hide breakdown
     if (brkEl) {
       if (sur > 0) {
         brkEl.removeAttribute('hidden');
@@ -246,35 +266,63 @@
         brkEl.setAttribute('hidden', '');
       }
     }
+  }
 
-    // Sync hidden inputs into the theme's product form
+  // ── Full update ────────────────────────────────────────────────────────────
+  function update() {
+    updateDisplay();
+    syncForm();
+  }
+
+  // ── Intercept ATC button to guarantee fresh sync before submit ────────────
+  // Handles both native form submit and Ajax drawer cart themes (Dawn etc.)
+  function interceptATC() {
     var form = getForm();
     if (!form) return;
 
-    var mLabel = metalSel ? metalSel.options[metalSel.selectedIndex].dataset.label : 'Standard';
-    var dLabel = diaSel   ? diaSel.options[diaSel.selectedIndex].dataset.label     : 'No Diamond';
+    // Intercept native form submit
+    form.addEventListener('submit', function () {
+      syncForm(); // ensure latest values right before submit
+    }, true);    // capture phase — runs before theme JS
 
-    // Visible line item properties (shown in cart / order)
-    hiddenInput(form, 'properties[Metal]').value   = mLabel;
-    hiddenInput(form, 'properties[Diamond]').value = dLabel;
+    // Intercept Ajax fetch (Dawn drawer cart calls fetch('/cart/add.js'))
+    // We patch fetch to inject properties into JSON body if it's a cart/add call
+    var _fetch = window.fetch;
+    window.fetch = function (url, opts) {
+      if (typeof url === 'string' && url.includes('/cart/add')) {
+        try {
+          var body = JSON.parse(opts && opts.body ? opts.body : '{}');
+          var sur  = getSurchargeCents();
 
-    // ✅ FIXED — send final total price in dollars for cart transform
-    hiddenInput(form, 'properties[_surcharge]').value   = (total / 100).toFixed(2);
-    hiddenInput(form, 'properties[_metal_cents]').value = mCents;
-    hiddenInput(form, 'properties[_dia_cents]').value   = dCents;
+          if (!body.properties) body.properties = {};
+
+          var mLabel = metalSel ? metalSel.options[metalSel.selectedIndex].dataset.label : 'Standard';
+          var dLabel = diaSel   ? diaSel.options[diaSel.selectedIndex].dataset.label     : 'No Diamond';
+
+          body.properties['Metal']       = mLabel;
+          body.properties['Diamond']     = dLabel;
+          body.properties['_surcharge']  = sur;
+          body.properties['_currency']   = currency;
+
+          opts = Object.assign({}, opts, { body: JSON.stringify(body) });
+        } catch (e) {
+          // If body isn't JSON (e.g. FormData), fall through untouched
+        }
+      }
+      return _fetch.apply(window, arguments);
+    };
   }
 
-  // ── Respond to theme variant changes ─────────────────────────────────────
-  // Pattern 1: custom event dispatched by many themes
+  // ── Variant change — Pattern 1: custom event ──────────────────────────────
   document.addEventListener('variant:change', function (e) {
     if (e.detail && e.detail.variant && e.detail.variant.price !== undefined) {
       basePrice = e.detail.variant.price;
-      block.dataset.basePrice = basePrice;
+      blockEl.dataset.basePrice = basePrice;
       update();
     }
   });
 
-  // Pattern 2: Dawn theme — mutates the hidden [name="id"] input value
+  // ── Variant change — Pattern 2: Dawn MutationObserver ─────────────────────
   var form = getForm();
   if (form) {
     var varInput = form.querySelector('input[name="id"]');
@@ -283,23 +331,22 @@
         var priceItem = document.querySelector('[data-price-type="regular"]');
         if (priceItem && priceItem.dataset.price) {
           basePrice = parseInt(priceItem.dataset.price, 10);
-          block.dataset.basePrice = basePrice;
+          blockEl.dataset.basePrice = basePrice;
           update();
         }
       }).observe(varInput, { attributes: true, attributeFilter: ['value'] });
     }
   }
 
-  // ── Attach select listeners ──────────────────────────────────────────────
   if (metalSel) metalSel.addEventListener('change', update);
   if (diaSel)   diaSel.addEventListener('change',   update);
 
-  // ── Re-init after section reload (theme editor) ──────────────────────────
   document.addEventListener('shopify:section:load', function () {
     setTimeout(update, 100);
   });
 
-  // ── Initial render ───────────────────────────────────────────────────────
+  // ── Init ──────────────────────────────────────────────────────────────────
+  interceptATC();
   update();
 
 }());

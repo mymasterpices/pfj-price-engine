@@ -1,3 +1,90 @@
+async function ensureCartTransform(admin) {
+  try {
+    // 1. Check if already registered
+    const listRes = await admin.graphql(`#graphql
+      query {
+        cartTransforms(first: 10) {
+          nodes {
+            id
+            functionId
+          }
+        }
+      }
+    `);
+
+    const { data: listData } = await listRes.json();
+    const existing = listData?.cartTransforms?.nodes ?? [];
+
+    // 2. Get our function ID
+    const fnRes = await admin.graphql(`#graphql
+      query {
+        shopifyFunctions(first: 25) {
+          nodes {
+            id
+            title
+            apiType
+          }
+        }
+      }
+    `);
+
+    const { data: fnData } = await fnRes.json();
+    const fn = fnData?.shopifyFunctions?.nodes?.find(
+      (f) => f.apiType === "cart_transform" && f.title === "pfj-cart-transform",
+    );
+
+    if (!fn) {
+      console.log("PFJ: Cart transform function not found — deploy first");
+      return;
+    }
+
+    // 3. Already registered? Skip
+    const alreadyRegistered = existing.some((e) => e.functionId === fn.id);
+    if (alreadyRegistered) {
+      console.log("PFJ: Cart transform already registered ✅");
+      return;
+    }
+
+    // 4. ✅ FIXED — no input wrapper
+    const createRes = await admin.graphql(
+      `#graphql
+      mutation cartTransformCreate($functionId: String!, $blockOnFailure: Boolean!) {
+        cartTransformCreate(
+          functionId: $functionId
+          blockOnFailure: $blockOnFailure
+        ) {
+          cartTransform {
+            id
+            functionId
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+      {
+        variables: {
+          functionId: fn.id,
+          blockOnFailure: false,
+        },
+      },
+    );
+
+    const { data: createData } = await createRes.json();
+    const errors = createData?.cartTransformCreate?.userErrors ?? [];
+
+    if (errors.length > 0) {
+      console.error("PFJ: Cart transform registration failed:", errors);
+    } else {
+      console.log("PFJ: Cart transform registered successfully ✅");
+    }
+  } catch (err) {
+    console.error("PFJ: ensureCartTransform error:", err);
+  }
+}
+
 // app/routes/app._index.jsx
 import { useLoaderData } from "react-router";
 import { authenticate } from "../shopify.server";
