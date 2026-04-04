@@ -1,0 +1,356 @@
+{% comment %}
+  ============================================================================
+  PFJ Price Selector — Theme App Extension Block
+  extensions/pfj-theme-ext/blocks/price-selector.liquid
+
+  How it works:
+  1. Reads rates from Shop Metafields (set by the admin app) — zero API lag
+  2. Renders metal + diamond dropdowns
+  3. Shows a live updated total price
+  4. Injects hidden <input> fields into the theme's existing product form
+  5. The theme's native "Add to cart" button submits everything — no custom button
+  6. Cart Transform Function reads _surcharge and locks the real price at checkout
+  ============================================================================
+{% endcomment %}
+
+{% comment %} ── Read rates from Shop Metafields — stored as dollars, convert to cents ── {% endcomment %}
+{% assign mf    = shop.metafields.pfj_pricing %}
+{% assign r_18k = mf.gold_18k.value | default: 0 | times: 100 | round %}
+{% assign r_14k = mf.gold_14k.value | default: 0 | times: 100 | round %}
+{% assign r_9k  = mf.gold_9k.value  | default: 0 | times: 100 | round %}
+{% assign r_nat = mf.dia_nat.value  | default: 0 | times: 100 | round %}
+{% assign r_lab = mf.dia_lab.value  | default: 0 | times: 100 | round %}
+
+{% comment %} ── Unique ID so multiple blocks on one page don't collide ── {% endcomment %}
+{% assign uid = block.id | remove: '-' | slice: 0, 10 %}
+
+<div
+  id="pfj-{{ uid }}"
+  class="pfj-selector"
+  data-uid="{{ uid }}"
+  data-base-price="{{ product.selected_or_first_available_variant.price }}"
+  {{ block.shopify_attributes }}
+>
+
+  {% comment %} ─── Metal dropdown ──────────────────────────────────────── {% endcomment %}
+  {% if block.settings.show_metal %}
+  <div class="pfj-field">
+    <label class="pfj-label" for="pfj-metal-{{ uid }}">
+      {{- block.settings.metal_label | default: 'Metal' -}}
+    </label>
+    <div class="pfj-select-wrap">
+      <select id="pfj-metal-{{ uid }}" class="pfj-select" data-pfj="metal">
+        <option value="0" data-label="Standard">Standard</option>
+        <option value="{{ r_18k }}" data-label="18K Gold">
+          18K Gold{% if r_18k > 0 %} (+{{ r_18k | money }}){% endif %}
+        </option>
+        <option value="{{ r_14k }}" data-label="14K Gold">
+          14K Gold{% if r_14k > 0 %} (+{{ r_14k | money }}){% endif %}
+        </option>
+        <option value="{{ r_9k }}" data-label="9K Gold">
+          9K Gold{% if r_9k > 0 %} (+{{ r_9k | money }}){% endif %}
+        </option>
+      </select>
+    </div>
+  </div>
+  {% endif %}
+
+  {% comment %} ─── Diamond dropdown ─────────────────────────────────────── {% endcomment %}
+  {% if block.settings.show_diamond %}
+  <div class="pfj-field">
+    <label class="pfj-label" for="pfj-diamond-{{ uid }}">
+      {{- block.settings.diamond_label | default: 'Diamond' -}}
+    </label>
+    <div class="pfj-select-wrap">
+      <select id="pfj-diamond-{{ uid }}" class="pfj-select" data-pfj="diamond">
+        <option value="0" data-label="No Diamond">No Diamond</option>
+        <option value="{{ r_nat }}" data-label="Natural Diamond">
+          Natural Diamond{% if r_nat > 0 %} (+{{ r_nat | money }}){% endif %}
+        </option>
+        <option value="{{ r_lab }}" data-label="Lab Grown Diamond">
+          Lab Grown Diamond{% if r_lab > 0 %} (+{{ r_lab | money }}){% endif %}
+        </option>
+      </select>
+    </div>
+  </div>
+  {% endif %}
+
+  {% comment %} ─── Price display ────────────────────────────────────────── {% endcomment %}
+  <div class="pfj-price-row">
+    <span class="pfj-price-label">
+      {{ block.settings.price_label | default: 'Total price' }}
+    </span>
+    <span class="pfj-price-value" id="pfj-price-{{ uid }}">
+      {{ product.selected_or_first_available_variant.price | money }}
+    </span>
+  </div>
+
+  {% comment %} ─── Breakdown (hidden until surcharge > 0) ─────────────── {% endcomment %}
+  <div class="pfj-breakdown" id="pfj-breakdown-{{ uid }}" hidden>
+    <span>Base: <strong id="pfj-base-{{ uid }}"></strong></span>
+    <span>+ surcharge: <strong id="pfj-sur-{{ uid }}"></strong></span>
+  </div>
+
+</div>
+
+<style>
+.pfj-selector { margin: 12px 0; }
+
+.pfj-field { margin-bottom: 14px; }
+
+.pfj-label {
+  display: block;
+  font-size: .875rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: rgb(var(--color-foreground, 18 18 18));
+  letter-spacing: .04em;
+}
+
+.pfj-select-wrap { position: relative; }
+
+.pfj-select-wrap::after {
+  content: '';
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+  opacity: .6;
+}
+
+.pfj-select {
+  width: 100%;
+  padding: .75rem 2.5rem .75rem 1rem;
+  border: .1rem solid rgba(var(--color-foreground, 18 18 18), .45);
+  border-radius: var(--inputs-radius, .4rem);
+  background: rgb(var(--color-background, 255 255 255));
+  color: rgb(var(--color-foreground, 18 18 18));
+  font-size: 1rem;
+  font-family: inherit;
+  appearance: none;
+  cursor: pointer;
+  transition: border-color .15s;
+  line-height: 1.5;
+}
+
+.pfj-select:focus {
+  outline: .2rem solid rgba(var(--color-foreground, 18 18 18), .45);
+  outline-offset: .3rem;
+  border-color: rgba(var(--color-foreground, 18 18 18), .9);
+}
+
+.pfj-price-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 12px 0;
+  border-top: .1rem solid rgba(var(--color-foreground, 18 18 18), .08);
+  margin-top: 4px;
+}
+
+.pfj-price-label {
+  font-size: .875rem;
+  color: rgba(var(--color-foreground, 18 18 18), .7);
+}
+
+.pfj-price-value {
+  font-size: 1.3rem;
+  font-weight: 700;
+  color: rgb(var(--color-foreground, 18 18 18));
+  transition: color .15s;
+}
+
+.pfj-breakdown {
+  display: flex;
+  gap: 1.2rem;
+  font-size: .75rem;
+  color: rgba(var(--color-foreground, 18 18 18), .55);
+  padding-bottom: 8px;
+}
+
+.pfj-breakdown[hidden] { display: none; }
+</style>
+
+<script>
+(function () {
+  'use strict';
+
+  var UID      = {{ uid | json }};
+  var block    = document.getElementById('pfj-' + UID);
+  if (!block) return;
+
+  var metalSel = block.querySelector('[data-pfj="metal"]');
+  var diaSel   = block.querySelector('[data-pfj="diamond"]');
+  var priceEl  = document.getElementById('pfj-price-'     + UID);
+  var brkEl    = document.getElementById('pfj-breakdown-' + UID);
+  var baseEl   = document.getElementById('pfj-base-'      + UID);
+  var surEl    = document.getElementById('pfj-sur-'       + UID);
+
+  // Base price in cents (Shopify always outputs price in cents)
+  var basePrice = parseInt(block.dataset.basePrice, 10) || 0;
+
+  // ── Money formatter ──────────────────────────────────────────────────────
+  function money(cents) {
+    if (window.Shopify && window.Shopify.formatMoney) {
+      return window.Shopify.formatMoney(cents, '{{ shop.money_format | escape_once }}');
+    }
+    return '$' + (cents / 100).toFixed(2);
+  }
+
+  // ── Find the theme's product form ────────────────────────────────────────
+  function getForm() {
+    var el = block.parentElement;
+    while (el && el !== document.body) {
+      var f = el.querySelector('form[action*="/cart/add"]');
+      if (f) return f;
+      el = el.parentElement;
+    }
+    return document.querySelector('form[action*="/cart/add"]');
+  }
+
+  // ── Ensure a hidden input exists in the form ─────────────────────────────
+  function hiddenInput(form, name) {
+    var sel = 'input[name="' + name + '"]';
+    var inp = form.querySelector(sel);
+    if (!inp) {
+      inp = document.createElement('input');
+      inp.type = 'hidden';
+      inp.name = name;
+      form.appendChild(inp);
+    }
+    return inp;
+  }
+
+  // ── Recalculate and sync ─────────────────────────────────────────────────
+  function update() {
+    var mCents = parseInt(metalSel ? metalSel.value : 0, 10) || 0;
+    var dCents = parseInt(diaSel   ? diaSel.value   : 0, 10) || 0;
+    var sur    = mCents + dCents;
+    var total  = basePrice + sur;
+
+    // Update visible price display
+    if (priceEl) priceEl.textContent = money(total);
+
+    // Show/hide breakdown
+    if (brkEl) {
+      if (sur > 0) {
+        brkEl.removeAttribute('hidden');
+        if (baseEl) baseEl.textContent = money(basePrice);
+        if (surEl)  surEl.textContent  = money(sur);
+      } else {
+        brkEl.setAttribute('hidden', '');
+      }
+    }
+
+    // Sync hidden inputs into the theme's product form
+    var form = getForm();
+    if (!form) return;
+
+    var mLabel = metalSel ? metalSel.options[metalSel.selectedIndex].dataset.label : 'Standard';
+    var dLabel = diaSel   ? diaSel.options[diaSel.selectedIndex].dataset.label     : 'No Diamond';
+
+    // Visible line item properties (shown in cart / order)
+    hiddenInput(form, 'properties[Metal]').value   = mLabel;
+    hiddenInput(form, 'properties[Diamond]').value = dLabel;
+
+    // ✅ FIXED — send final total price in dollars for cart transform
+    hiddenInput(form, 'properties[_surcharge]').value   = (total / 100).toFixed(2);
+    hiddenInput(form, 'properties[_metal_cents]').value = mCents;
+    hiddenInput(form, 'properties[_dia_cents]').value   = dCents;
+  }
+
+  // ── Respond to theme variant changes ─────────────────────────────────────
+  // Pattern 1: custom event dispatched by many themes
+  document.addEventListener('variant:change', function (e) {
+    if (e.detail && e.detail.variant && e.detail.variant.price !== undefined) {
+      basePrice = e.detail.variant.price;
+      block.dataset.basePrice = basePrice;
+      update();
+    }
+  });
+
+  // Pattern 2: Dawn theme — mutates the hidden [name="id"] input value
+  var form = getForm();
+  if (form) {
+    var varInput = form.querySelector('input[name="id"]');
+    if (varInput) {
+      new MutationObserver(function () {
+        var priceItem = document.querySelector('[data-price-type="regular"]');
+        if (priceItem && priceItem.dataset.price) {
+          basePrice = parseInt(priceItem.dataset.price, 10);
+          block.dataset.basePrice = basePrice;
+          update();
+        }
+      }).observe(varInput, { attributes: true, attributeFilter: ['value'] });
+    }
+  }
+
+  // ── Attach select listeners ──────────────────────────────────────────────
+  if (metalSel) metalSel.addEventListener('change', update);
+  if (diaSel)   diaSel.addEventListener('change',   update);
+
+  // ── Re-init after section reload (theme editor) ──────────────────────────
+  document.addEventListener('shopify:section:load', function () {
+    setTimeout(update, 100);
+  });
+
+  // ── Initial render ───────────────────────────────────────────────────────
+  update();
+
+}());
+</script>
+
+{% schema %}
+{
+  "name": "PFJ Price Selector",
+  "target": "section",
+  "enabled_on": {
+    "templates": ["product"]
+  },
+  "settings": [
+    {
+      "type": "header",
+      "content": "Visibility"
+    },
+    {
+      "type": "checkbox",
+      "id": "show_metal",
+      "label": "Show metal selector",
+      "default": true
+    },
+    {
+      "type": "checkbox",
+      "id": "show_diamond",
+      "label": "Show diamond selector",
+      "default": true
+    },
+    {
+      "type": "header",
+      "content": "Labels"
+    },
+    {
+      "type": "text",
+      "id": "metal_label",
+      "label": "Metal selector label",
+      "default": "Metal"
+    },
+    {
+      "type": "text",
+      "id": "diamond_label",
+      "label": "Diamond selector label",
+      "default": "Diamond"
+    },
+    {
+      "type": "text",
+      "id": "price_label",
+      "label": "Total price label",
+      "default": "Total price"
+    }
+  ]
+}
+{% endschema %}
