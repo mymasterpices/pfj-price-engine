@@ -5,15 +5,16 @@
 //   2. Saves to Prisma
 //   3. Mirrors to Shop Metafields (storefront reads these)
 //   4. Fetches ALL products + their variants
-//   5. Reads per-product metafields: custom.metal_weight_grams,
-//      custom.diamond_carat, custom.making_charge
+//   5. Reads per-product metafields: custom.gold_weight,
+//      custom.diamond_weight, custom.stone_price, custom.making_charges
 //   6. Calculates new price per variant based on metal/diamond option titles
 //   7. Calls productVariantsBulkUpdate for every product
 //
 // Formula:
-//   variant_price = (metal_weight_grams × metal_rate)
-//                 + (diamond_carat     × diamond_rate)
-//                 + making_charge
+//   variant_price = (gold_weight × gold_rate)
+//                 + (diamond_weight × diamond_rate)
+//                 + stone_price
+//                 + making_charges
 //
 // Variant option matching (case-insensitive):
 //   "Gold 18K" / "18k gold" → gold18k rate
@@ -117,7 +118,7 @@ export const loader = async ({ request }) => {
 // HELPERS — GraphQL pagination
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Fetch all products with their variants + the 3 metafields we need
+// Fetch all products with their variants + the 4 metafields we need
 async function fetchAllProducts(admin) {
   const products = [];
   let cursor = null;
@@ -205,6 +206,27 @@ async function bulkUpdateVariantPrices(admin, productId, variants) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HELPER — safe metafield fallback
+//
+// The previous code used:
+//   parseFloat(variant.field?.value ?? productValue) || productValue
+//
+// The `|| productValue` part caused a silent bug: if the variant metafield
+// was explicitly set to "0", parseFloat("0") === 0 which is falsy, so the
+// expression fell through to productValue instead of honouring the override.
+//
+// This helper fixes that by only falling back when the metafield is absent
+// (null/undefined), never when its parsed value happens to be 0.
+// ─────────────────────────────────────────────────────────────────────────────
+function resolveMetafield(variantMetafield, productFallback) {
+  if (variantMetafield?.value != null) {
+    const parsed = parseFloat(variantMetafield.value);
+    return isNaN(parsed) ? productFallback : parsed;
+  }
+  return productFallback;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ACTION
 // ─────────────────────────────────────────────────────────────────────────────
 export const action = async ({ request }) => {
@@ -284,7 +306,7 @@ export const action = async ({ request }) => {
   for (const product of products) {
     const variantUpdates = [];
 
-    // Product-level fallback values
+    // Product-level fallback values (used when the variant has no override)
     const productGoldWeight = parseFloat(product.goldWeight?.value ?? 0) || 0;
     const productDiamondWeight =
       parseFloat(product.diamondWeight?.value ?? 0) || 0;
@@ -293,19 +315,26 @@ export const action = async ({ request }) => {
       parseFloat(product.makingCharges?.value ?? 0) || 0;
 
     for (const variant of product.variants.nodes) {
-      // Per-variant overrides (fall back to product-level)
-      const goldWeight =
-        parseFloat(variant.goldWeight?.value ?? productGoldWeight) ||
-        productGoldWeight;
-      const diamondWeight =
-        parseFloat(variant.diamondWeight?.value ?? productDiamondWeight) ||
-        productDiamondWeight;
-      const stonePrice =
-        parseFloat(variant.stonePrice?.value ?? productStonePrice) ||
-        productStonePrice;
-      const makingCharges =
-        parseFloat(variant.makingCharges?.value ?? productMakingCharges) ||
-        productMakingCharges;
+      // Per-variant overrides — fall back to product-level only when the
+      // variant metafield is absent (null/undefined).  A variant value of "0"
+      // is a valid explicit override and must NOT be replaced by the product
+      // default (the old `|| productValue` pattern caused that silent bug).
+      const goldWeight = resolveMetafield(
+        variant.goldWeight,
+        productGoldWeight,
+      );
+      const diamondWeight = resolveMetafield(
+        variant.diamondWeight,
+        productDiamondWeight,
+      );
+      const stonePrice = resolveMetafield(
+        variant.stonePrice,
+        productStonePrice,
+      );
+      const makingCharges = resolveMetafield(
+        variant.makingCharges,
+        productMakingCharges,
+      );
 
       // Determine which metal and diamond rates apply to this variant
       // by inspecting its selectedOptions
@@ -326,16 +355,19 @@ export const action = async ({ request }) => {
         continue;
       }
 
-      // Use 0 for whichever component isn't present
+      // Use 0 for whichever component isn't present on this variant
       const gRate = goldRate ?? 0;
       const dRate = diamondRate ?? 0;
 
       // Formula:
-      // price = (gold_weight × gold_rate_per_gram)
-      //       + (diamond_weight × stone_price / diamond_rate_per_unit)
-      //       + making_charges
-      const newPrice =
-        goldWeight * gRate + diamondWeight * dRate + stonePrice + makingCharges;
+      //   basePrice = (gold_weight × gold_rate_per_gram)
+      //             + (diamond_weight × diamond_rate_per_carat)
+      //             + stone_price
+      //   price = basePrice × (1 + making_charges / 100)
+      //
+      // e.g. basePrice = 4000, making_charges = 15 → 4000 × 1.15 = 4600
+      const basePrice = goldWeight * gRate + diamondWeight * dRate + stonePrice;
+      const newPrice = basePrice * (1 + makingCharges / 100);
 
       if (newPrice <= 0) {
         repriceResults.skipped++;
@@ -506,8 +538,10 @@ export default function RatesPage() {
         across all products using the formula:
         <br />
         <code>
-          price = (gold_weight × gold_rate) + (diamond_weight × diamond_rate) +
-          stone_price + making_charges
+          base = (gold_weight × gold_rate) + (diamond_weight × diamond_rate) +
+          stone_price
+          <br />
+          price = base × (1 + making_charges / 100)
         </code>
         <br />
         Weights are read from <code>custom.gold_weight</code> and{" "}
@@ -531,7 +565,7 @@ export default function RatesPage() {
                 <s-stack direction="block" gap="base">
                   <s-heading>Metal rates (₹ per gram)</s-heading>
                   <s-text tone="subdued">
-                    Multiplied by <code>custom.metal_weight_grams</code> on each
+                    Multiplied by <code>custom.gold_weight</code> on each
                     product/variant.
                   </s-text>
                   <s-grid>
@@ -561,7 +595,7 @@ export default function RatesPage() {
                 <s-stack direction="block" gap="base">
                   <s-heading>Diamond rates (₹ per carat)</s-heading>
                   <s-text tone="subdued">
-                    Multiplied by <code>custom.diamond_carat</code> on each
+                    Multiplied by <code>custom.diamond_weight</code> on each
                     product/variant.
                   </s-text>
                   <s-grid>
@@ -664,10 +698,11 @@ export default function RatesPage() {
 function FormulaPreview({ form }) {
   const g = (k) => Math.max(0, parseFloat(form[k]) || 0);
 
-  // Example: 5g ring + 0.25ct diamond + ₹500 making charge
+  // Example: 5g ring + 0.25ct diamond + ₹500 stone price + 15% making charge
   const METAL_WEIGHT = 5;
   const DIAMOND_CARAT = 0.25;
-  const MAKING = 500;
+  const STONE_PRICE = 500;
+  const MAKING = 15; // percent
 
   const combos = [
     {
@@ -711,8 +746,8 @@ function FormulaPreview({ form }) {
   return (
     <>
       <s-text tone="subdued">
-        Example: {METAL_WEIGHT}g metal · {DIAMOND_CARAT}ct diamond · ₹{MAKING}{" "}
-        making
+        Example: {METAL_WEIGHT}g metal · {DIAMOND_CARAT}ct diamond · ₹
+        {STONE_PRICE} stone · {MAKING}% making
       </s-text>
       <table style={tbl.table}>
         <thead>
@@ -723,7 +758,9 @@ function FormulaPreview({ form }) {
         </thead>
         <tbody>
           {combos.map(({ metal, mRate, dLabel, dRate }) => {
-            const price = METAL_WEIGHT * mRate + DIAMOND_CARAT * dRate + MAKING;
+            const base =
+              METAL_WEIGHT * mRate + DIAMOND_CARAT * dRate + STONE_PRICE;
+            const price = base * (1 + MAKING / 100);
             return (
               <tr key={metal + dLabel}>
                 <td style={tbl.td}>
