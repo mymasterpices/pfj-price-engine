@@ -1,0 +1,52 @@
+/**
+ * DEBUGGING SCRIPT - Add to your theme footer
+ * 
+ * Paste this in Shopify Admin → Online Store → Themes → Edit Code
+ * → Add to theme.liquid or product-template.liquid before closing </body>
+ * 
+ * This script will show us exactly what's in the cart and whether
+ * the surcharge is being stored properly.
+ */
+
+<script>
+(function() {
+  'use strict';
+
+  console.log('=== PFJ Cart Debug Script Starting ===');
+
+  // Function to check cart data
+  function debugCart() {
+    fetch('/cart.js')
+      .then(res => res.json())
+      .then(cart => {
+        console.group('📦 CART DEBUG INFO');
+        console.log('Total items:', cart.items.length);
+        
+        cart.items.forEach((item, idx) => {
+          console.group(`Item ${idx}: ${item.title}`);
+          console.log('Price:', item.price, 'cents');
+          console.log('Quantity:', item.quantity);
+          console.log('Properties:', item.properties);
+          console.log('Has _surcharge?', item.properties && item.properties._surcharge ? '✅ YES' : '❌ NO');
+          if (item.properties && item.properties._surcharge) {
+            console.log('_surcharge value:', item.properties._surcharge);
+          }
+          console.groupEnd();
+        });
+        
+        console.log('Full cart object:', cart);
+        console.groupEnd();
+      })
+      .catch(err => console.error('Error fetching cart:', err));
+  }
+
+  // Make function globally accessible
+  window.debugPFJCart = debugCart;
+
+  // Auto-run on page load
+  console.log('To debug cart manually, run: debugPFJCart() in console');
+
+  // Also log it immediately
+  setTimeout(debugCart, 1000);
+})();
+</script>

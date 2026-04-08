@@ -110,10 +110,10 @@ export default function Index() {
 
   return (
     <s-page heading="PFJ Pricing Engine">
-      <s-button slot="primary-action" variant="primary" url="/app/rates">
+      <s-button slot="primary-action" variant="primary" href="/app/rates">
         Manage Daily Rates
       </s-button>
-
+      
       {/* Status banner */}
       {hasRates ? (
         <s-banner tone="success" title="Rates are configured">
@@ -124,7 +124,6 @@ export default function Index() {
           Click "Manage Daily Rates" to set your first pricing rates.
         </s-banner>
       )}
-
       <s-section>
         <s-stack direction="block" gap="base">
           <s-box
@@ -143,14 +142,15 @@ export default function Index() {
                 2. Rates are saved to Prisma and mirrored to Shop Metafields.
               </s-text>
               <s-text>
-                3. The storefront block reads rates directly from Liquid.
+                3. Admin need to create product variants with the correct
+                metafields and save it.
               </s-text>
               <s-text>
-                4. Customer selects metal and diamond on the product page.
+                4. The system calculates the price based on the selected
+                options.
               </s-text>
               <s-text>
-                5. Cart Transform Function applies the correct price at
-                checkout.
+                5. Customer selects metal and diamond on the product page.
               </s-text>
             </s-stack>
           </s-box>

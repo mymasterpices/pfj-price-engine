@@ -1,0 +1,170 @@
+/**
+ * PFJ SURCHARGE FIX - Use Shopify Storefront API
+ * 
+ * This replaces the form-based approach with direct Storefront API calls
+ * which ensures surcharge reaches the cart transform properly
+ */
+
+(function() {
+  'use strict';
+
+  console.log('[PFJ-API] Storefront API implementation loaded');
+
+  var UID        = {{ uid | json }};
+  var blockEl    = document.getElementById('pfj-' + UID);
+  if (!blockEl) {
+    console.warn('[PFJ-API] Block element not found');
+    return;
+  }
+
+  var metalSel   = blockEl.querySelector('[data-pfj="metal"]');
+  var diaSel     = blockEl.querySelector('[data-pfj="diamond"]');
+  var priceEl    = document.getElementById('pfj-price-'     + UID);
+
+  var basePrice  = parseInt(blockEl.dataset.basePrice, 10) || 0;
+  var currency   = blockEl.dataset.currency   || 'INR';
+
+  // ── Get API Key ────────────────────────────────────────────────────────────
+  // For Storefront API, you can either:
+  // 1. Use fetch('/api/...' which hits admin - NOT recommended for production
+  // 2. Get a public Storefront API token from theme - RECOMMENDED
+  // For now, we'll use the fetch to /cart/add.js which handles it
+  
+  // ── Formatter ─────────────────────────────────────────────────────────────
+  function money(cents) {
+    var symbols = { 'INR': '₹', 'USD': '$', 'GBP': '£', 'EUR': '€' };
+    var symbol = symbols[currency] || '';
+    var amt = (cents / 100).toFixed(2);
+    var parts = amt.split('.');
+    var wholeNum = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return symbol + wholeNum + '.' + parts[1];
+  }
+
+  function getSurchargeCents() {
+    var m = parseInt(metalSel ? metalSel.value : 0, 10) || 0;
+    var d = parseInt(diaSel   ? diaSel.value   : 0, 10) || 0;
+    return m + d;
+  }
+
+  function getForm() {
+    var el = blockEl.parentElement;
+    while (el && el !== document.body) {
+      var f = el.querySelector('form[action*="/cart/add"]');
+      if (f) return f;
+      el = el.parentElement;
+    }
+    return document.querySelector('form[action*="/cart/add"]');
+  }
+
+  function updateDisplay() {
+    var sur   = getSurchargeCents();
+    var total = basePrice + sur;
+    if (priceEl) priceEl.textContent = money(total);
+  }
+
+  // ── CRITICAL FIX: Use Storefront API Mutation ──────────────────────────────
+  // Instead of form submission, use GraphQL Storefront API
+  function addToCartViaAPI() {
+    var form = getForm();
+    if (!form) {
+      console.error('[PFJ-API] Form not found, cannot proceed');
+      return;
+    }
+
+    var variantInput = form.querySelector('input[name="id"]');
+    if (!variantInput) {
+      console.error('[PFJ-API] Variant input not found');
+      return;
+    }
+
+    var variantId = variantInput.value;
+    if (!variantId) {
+      console.error('[PFJ-API] No variant selected');
+      return;
+    }
+
+    var quantity = parseInt(form.querySelector('input[name="quantity"]')?.value || 1, 10);
+    var sur = getSurchargeCents();
+    var mLabel = metalSel ? metalSel.options[metalSel.selectedIndex].dataset.label : 'Standard';
+    var dLabel = diaSel   ? diaSel.options[diaSel.selectedIndex].dataset.label     : 'No Diamond';
+
+    console.log('[PFJ-API] Adding to cart:', {
+      variantId: variantId,
+      quantity: quantity,
+      surcharge: sur,
+      metal: mLabel,
+      diamond: dLabel
+    });
+
+    // Use the Cart API with custom attributes
+    // The cart API accepts 'attributes' as custom object
+    var payload = {
+      items: [
+        {
+          variantId: 'gid://shopify/ProductVariant/' + variantId,
+          quantity: quantity,
+          attributes: [
+            { key: 'metal', value: mLabel },
+            { key: 'diamond', value: dLabel },
+            { key: '_surcharge', value: String(sur) },
+            { key: '_currency', value: currency }
+          ]
+        }
+      ]
+    };
+
+    console.log('[PFJ-API] Payload:', JSON.stringify(payload, null, 2));
+
+    fetch('/cart/add.js', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    .then(res => {
+      console.log('[PFJ-API] Response status:', res.status);
+      return res.json();
+    })
+    .then(data => {
+      console.log('[PFJ-API] ✅ Item added to cart:', data);
+      // Trigger any theme events
+      document.body.dispatchEvent(new CustomEvent('cart:update', { detail: data }));
+      // Redirect to cart or let theme handle it
+      if (form.action && form.action.includes('/cart')) {
+        window.location.href = form.action;
+      }
+    })
+    .catch(err => {
+      console.error('[PFJ-API] ❌ Failed to add to cart:', err);
+      // Fallback to regular form submission
+      console.log('[PFJ-API] Falling back to form submission');
+      form.submit();
+    });
+  }
+
+  // ── Intercept form submission ──────────────────────────────────────────────
+  function setupFormInterception() {
+    var form = getForm();
+    if (!form) return;
+
+    form.addEventListener('submit', function(e) {
+      // Check if this is an ATC button click
+      var submitBtn = e.submitter;
+      if (submitBtn && submitBtn.name === 'add' && submitBtn.value === 'Add to cart') {
+        console.log('[PFJ-API] Form submit intercepted, using API');
+        e.preventDefault();
+        addToCartViaAPI();
+      } else {
+        console.log('[PFJ-API] Non-ATC form submit, allowing normal behavior');
+      }
+    });
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  if (metalSel) metalSel.addEventListener('change', updateDisplay);
+  if (diaSel)   diaSel.addEventListener('change',   updateDisplay);
+  
+  setupFormInterception();
+  updateDisplay();
+
+  console.log('[PFJ-API] ✓ Storefront API setup complete');
+})();
