@@ -365,7 +365,7 @@ export const action = async ({ request }) => {
       //             + stone_price
       //   price = basePrice × (1 + making_charges / 100)
       //
-      // e.g. basePrice = 4000, making_charges = 15 → 4000 × 1.15 = 4600
+      // e.g. basePrice = 4000, making_charges = 15 → 4000 × 1.15 = 4600  
       const basePrice = goldWeight * gRate + diamondWeight * dRate + stonePrice;
       const newPrice = basePrice * (1 + makingCharges / 100);
 
