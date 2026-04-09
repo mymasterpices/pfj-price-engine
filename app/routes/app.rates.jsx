@@ -5,23 +5,27 @@
 //   2. Saves to Prisma
 //   3. Mirrors to Shop Metafields (storefront reads these)
 //   4. Fetches ALL products + their variants
-//   5. Reads per-product metafields: custom.gold_weight,
-//      custom.diamond_weight, custom.stone_price, custom.making_charges
+//   5. Reads per-product metafields:
+//        custom.gold_weight       — grams of gold
+//        custom.stone_price       — flat stone price (₹)
+//        custom.making_charges    — making charge percent (e.g. 15 = 15%)
+//        custom.natural_diamond   — flat price for natural diamond variant (₹)
+//        custom.lab_grown_diamond — flat price for lab-grown diamond variant (₹)
 //   6. Calculates new price per variant based on metal/diamond option titles
 //   7. Calls productVariantsBulkUpdate for every product
 //
 // Formula:
-//   variant_price = (gold_weight × gold_rate)
-//                 + (diamond_weight × diamond_rate)
-//                 + stone_price
-//                 + making_charges
+//   base  = (gold_weight × gold_rate) + diamond_flat_price + stone_price
+//   price = base × (1 + making_charges / 100)
 //
-// Variant option matching (case-insensitive):
+//   diamond_flat_price is read directly from the product metafield:
+//     "Natural" option   → custom.natural_diamond   (flat ₹, no multiplication)
+//     "Lab-grown" option → custom.lab_grown_diamond (flat ₹, no multiplication)
+//
+// Metal option matching (case-insensitive):
 //   "Gold 18K" / "18k gold" → gold18k rate
 //   "Gold 14K" / "14k gold" → gold14k rate
 //   "Gold 9K"  / "9k gold"  → gold9k  rate
-//   "Natural"               → diaNat  rate
-//   "Lab-grown" / "lab"     → diaLab  rate
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import {
@@ -34,7 +38,7 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONFIG
+// CONFIG — only metal rates are saved daily now; diamond prices live on products
 // ─────────────────────────────────────────────────────────────────────────────
 const METAFIELD_NAMESPACE = "pfj_pricing";
 
@@ -43,54 +47,39 @@ const FIELDS = [
     key: "gold18k",
     label: "18K Gold",
     unit: "per gram",
-    group: "metal",
     metaKey: "gold_18k",
   },
   {
     key: "gold14k",
     label: "14K Gold",
     unit: "per gram",
-    group: "metal",
     metaKey: "gold_14k",
   },
   {
     key: "gold9k",
     label: "9K Gold",
     unit: "per gram",
-    group: "metal",
     metaKey: "gold_9k",
-  },
-  {
-    key: "diaNat",
-    label: "Natural Diamond",
-    unit: "per carat",
-    group: "diamond",
-    metaKey: "dia_nat",
-  },
-  {
-    key: "diaLab",
-    label: "Lab Grown Diamond",
-    unit: "per carat",
-    group: "diamond",
-    metaKey: "dia_lab",
   },
 ];
 
-// ── Match variant option title → rate key ─────────────────────────────────────
+// ── Match variant option title → metal rate ───────────────────────────────────
 function getMetalRate(optionTitle, rates) {
   const t = optionTitle.toLowerCase().replace(/\s/g, "");
   if (t.includes("18k") || t.includes("18c")) return rates.gold18k;
   if (t.includes("14k") || t.includes("14c")) return rates.gold14k;
   if (t.includes("9k") || t.includes("9c")) return rates.gold9k;
-  return null; // not a metal option
+  return null;
 }
 
-function getDiamondRate(optionTitle, rates) {
+// ── Match variant option title → which diamond metafield key to use ───────────
+// Returns "natural_diamond" | "lab_grown_diamond" | null
+function getDiamondMetafieldKey(optionTitle) {
   const t = optionTitle.toLowerCase().replace(/\s/g, "");
   if (t.includes("natural") || t.includes("neutral") || t.includes("nat"))
-    return rates.diaNat;
-  if (t.includes("lab") || t.includes("grown")) return rates.diaLab;
-  return null; // not a diamond option
+    return "natural_diamond";
+  if (t.includes("lab") || t.includes("grown")) return "lab_grown_diamond";
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -118,7 +107,6 @@ export const loader = async ({ request }) => {
 // HELPERS — GraphQL pagination
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Fetch all products with their variants + the 4 metafields we need
 async function fetchAllProducts(admin) {
   const products = [];
   let cursor = null;
@@ -133,11 +121,8 @@ async function fetchAllProducts(admin) {
           nodes {
             id
             title
-            # Product-level defaults
+            # Product-level fields (variants fall back to these)
             goldWeight: metafield(namespace: "custom", key: "gold_weight") {
-              value
-            }
-            diamondWeight: metafield(namespace: "custom", key: "diamond_weight") {
               value
             }
             stonePrice: metafield(namespace: "custom", key: "stone_price") {
@@ -146,16 +131,20 @@ async function fetchAllProducts(admin) {
             makingCharges: metafield(namespace: "custom", key: "making_charges") {
               value
             }
+            # Flat diamond prices — product-level only, not per-variant
+            naturalDiamond: metafield(namespace: "custom", key: "natural_diamond") {
+              value
+            }
+            labGrownDiamond: metafield(namespace: "custom", key: "lab_grown_diamond") {
+              value
+            }
             variants(first: 100) {
               nodes {
                 id
                 title
                 selectedOptions { name value }
-                # Per-variant overrides (optional — falls back to product-level)
+                # Per-variant overrides (fall back to product-level if absent)
                 goldWeight: metafield(namespace: "custom", key: "gold_weight") {
-                  value
-                }
-                diamondWeight: metafield(namespace: "custom", key: "diamond_weight") {
                   value
                 }
                 stonePrice: metafield(namespace: "custom", key: "stone_price") {
@@ -183,7 +172,6 @@ async function fetchAllProducts(admin) {
   return products;
 }
 
-// Bulk update all variant prices for one product
 async function bulkUpdateVariantPrices(admin, productId, variants) {
   if (!variants.length) return [];
 
@@ -207,16 +195,7 @@ async function bulkUpdateVariantPrices(admin, productId, variants) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // HELPER — safe metafield fallback
-//
-// The previous code used:
-//   parseFloat(variant.field?.value ?? productValue) || productValue
-//
-// The `|| productValue` part caused a silent bug: if the variant metafield
-// was explicitly set to "0", parseFloat("0") === 0 which is falsy, so the
-// expression fell through to productValue instead of honouring the override.
-//
-// This helper fixes that by only falling back when the metafield is absent
-// (null/undefined), never when its parsed value happens to be 0.
+// Falls back only when the metafield is absent, never when its value is 0.
 // ─────────────────────────────────────────────────────────────────────────────
 function resolveMetafield(variantMetafield, productFallback) {
   if (variantMetafield?.value != null) {
@@ -306,26 +285,23 @@ export const action = async ({ request }) => {
   for (const product of products) {
     const variantUpdates = [];
 
-    // Product-level fallback values (used when the variant has no override)
+    // Product-level fallback values
     const productGoldWeight = parseFloat(product.goldWeight?.value ?? 0) || 0;
-    const productDiamondWeight =
-      parseFloat(product.diamondWeight?.value ?? 0) || 0;
     const productStonePrice = parseFloat(product.stonePrice?.value ?? 0) || 0;
     const productMakingCharges =
       parseFloat(product.makingCharges?.value ?? 0) || 0;
 
+    // Diamond prices are flat product-level values — no multiplication
+    const productNaturalDiamond =
+      parseFloat(product.naturalDiamond?.value ?? 0) || 0;
+    const productLabGrownDiamond =
+      parseFloat(product.labGrownDiamond?.value ?? 0) || 0;
+
     for (const variant of product.variants.nodes) {
-      // Per-variant overrides — fall back to product-level only when the
-      // variant metafield is absent (null/undefined).  A variant value of "0"
-      // is a valid explicit override and must NOT be replaced by the product
-      // default (the old `|| productValue` pattern caused that silent bug).
+      // Per-variant overrides for weight/stone/making (fall back to product)
       const goldWeight = resolveMetafield(
         variant.goldWeight,
         productGoldWeight,
-      );
-      const diamondWeight = resolveMetafield(
-        variant.diamondWeight,
-        productDiamondWeight,
       );
       const stonePrice = resolveMetafield(
         variant.stonePrice,
@@ -336,38 +312,61 @@ export const action = async ({ request }) => {
         productMakingCharges,
       );
 
-      // Determine which metal and diamond rates apply to this variant
-      // by inspecting its selectedOptions
+      // Determine metal rate and which flat diamond price applies.
+      // We check BOTH opt.name and opt.value because Shopify stores the
+      // user-facing label in opt.value (e.g. "Natural", "Lab Grown") but
+      // the option name in opt.name (e.g. "Diamond Type"). Matching on
+      // value is correct — just make sure your option values contain
+      // "natural" / "nat" or "lab" / "grown".
       let goldRate = null;
-      let diamondRate = null;
+      let diamondFlatPrice = null;
+
+      console.log(`[reprice] "${product.title}" / variant "${variant.title}"`);
+      console.log(
+        `  naturalDiamond metafield = ${productNaturalDiamond}, labGrownDiamond = ${productLabGrownDiamond}`,
+      );
 
       for (const opt of variant.selectedOptions) {
+        // Check both name and value so nothing is missed
+        const searchStr = (opt.name + " " + opt.value)
+          .toLowerCase()
+          .replace(/\s/g, "");
         const gRate = getMetalRate(opt.value, parsed);
-        const dRate = getDiamondRate(opt.value, parsed);
+        const dKey =
+          getDiamondMetafieldKey(opt.value) ?? getDiamondMetafieldKey(opt.name);
+
+        console.log(
+          `  opt name="${opt.name}" value="${opt.value}" → gRate=${gRate} dKey=${dKey}`,
+        );
+
         if (gRate !== null) goldRate = gRate;
-        if (dRate !== null) diamondRate = dRate;
+        if (dKey === "natural_diamond")
+          diamondFlatPrice = productNaturalDiamond;
+        if (dKey === "lab_grown_diamond")
+          diamondFlatPrice = productLabGrownDiamond;
       }
 
-      // Skip variants that don't match any metal or diamond option
-      // (e.g. size-only variants on non-jewelry products)
-      if (goldRate === null && diamondRate === null) {
+      console.log(
+        `  → resolved goldRate=${goldRate} diamondFlatPrice=${diamondFlatPrice}`,
+      );
+
+      // Skip variants with no metal and no diamond option matched
+      if (goldRate === null && diamondFlatPrice === null) {
         repriceResults.skipped++;
         continue;
       }
 
-      // Use 0 for whichever component isn't present on this variant
       const gRate = goldRate ?? 0;
-      const dRate = diamondRate ?? 0;
+      const dFlat = diamondFlatPrice ?? 0;
 
       // Formula:
-      //   basePrice = (gold_weight × gold_rate_per_gram)
-      //             + (diamond_weight × diamond_rate_per_carat)
-      //             + stone_price
-      //   price = basePrice × (1 + making_charges / 100)
+      //   base  = (gold_weight × gold_rate) + diamond_flat_price + stone_price
+      //   price = base × (1 + making_charges / 100)
       //
-      // e.g. basePrice = 4000, making_charges = 15 → 4000 × 1.15 = 4600  
-      const basePrice = goldWeight * gRate + diamondWeight * dRate + stonePrice;
-      const newPrice = basePrice * (1 + makingCharges / 100);
+      // diamond_flat_price comes straight from the product metafield — it is
+      // NOT multiplied by carat weight, just added as-is.
+      const base = goldWeight * gRate + dFlat + stonePrice;
+      const newPrice = base * (1 + makingCharges / 100);
 
       if (newPrice <= 0) {
         repriceResults.skipped++;
@@ -382,17 +381,13 @@ export const action = async ({ request }) => {
 
     if (variantUpdates.length === 0) continue;
 
-    // Shopify max 100 variants per bulkUpdate call — chunk if needed
     const CHUNK = 100;
     for (let i = 0; i < variantUpdates.length; i += CHUNK) {
       const chunk = variantUpdates.slice(i, i + CHUNK);
-      const errors = await bulkUpdateVariantPrices(admin, product.id, chunk);
+      const errs = await bulkUpdateVariantPrices(admin, product.id, chunk);
 
-      if (errors.length > 0) {
-        repriceResults.errors.push({
-          product: product.title,
-          errors,
-        });
+      if (errs.length > 0) {
+        repriceResults.errors.push({ product: product.title, errors: errs });
       } else {
         repriceResults.updated += chunk.length;
       }
@@ -419,7 +414,7 @@ function useNativeEvent(ref, event, handler) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SUB-COMPONENT — s-number-field wired to React state
+// SUB-COMPONENT — rate input field
 // ─────────────────────────────────────────────────────────────────────────────
 function RateField({ fieldKey, label, unit, value, error, onChange }) {
   const ref = useRef(null);
@@ -481,9 +476,6 @@ export default function RatesPage() {
   useNativeEvent(saveBtnRef, "click", handleSave);
   useNativeEvent(discardBtnRef, "click", handleDiscard);
 
-  const metalFields = FIELDS.filter((f) => f.group === "metal");
-  const diamondFields = FIELDS.filter((f) => f.group === "diamond");
-
   const repriced = actionData?.repriced;
 
   return (
@@ -504,7 +496,6 @@ export default function RatesPage() {
         </s-button>
       )}
 
-      {/* ── Success banner with reprice summary ── */}
       {actionData?.ok === true && (
         <s-banner tone="success" title="Rates saved — all variants repriced">
           {repriced && (
@@ -520,7 +511,6 @@ export default function RatesPage() {
         </s-banner>
       )}
 
-      {/* ── Error banners ── */}
       {actionData?.ok === false && actionData?.errors?.general && (
         <s-banner tone="critical" title="Save failed">
           {actionData.errors.general}
@@ -538,86 +528,53 @@ export default function RatesPage() {
         across all products using the formula:
         <br />
         <code>
-          base = (gold_weight × gold_rate) + (diamond_weight × diamond_rate) +
-          stone_price
-          <br />
-          price = base × (1 + making_charges / 100)
+          base = (gold_weight × gold_rate) + diamond_flat_price + stone_price
         </code>
         <br />
-        Weights are read from <code>custom.gold_weight</code> and{" "}
-        <code>custom.diamond_weight</code> metafields. Stone price from{" "}
-        <code>custom.stone_price</code> and making charges from{" "}
-        <code>custom.making_charges</code>.
+        <code>price = base × (1 + making_charges / 100)</code>
+        <br />
+        Diamond prices are set per-product via{" "}
+        <code>custom.natural_diamond</code> and{" "}
+        <code>custom.lab_grown_diamond</code> — flat ₹ amounts, not multiplied
+        by carat weight.
       </s-banner>
 
       <s-section>
         <s-grid>
-          {/* ── Left: rate input forms ── */}
+          {/* ── Left: metal rate inputs ── */}
           <s-grid-item column-span="2">
-            <s-stack direction="block" gap="base">
-              <s-box
-                padding="base"
-                background="base"
-                border-width="base"
-                border-color="base"
-                border-radius="base"
-              >
-                <s-stack direction="block" gap="base">
-                  <s-heading>Metal rates (₹ per gram)</s-heading>
-                  <s-text tone="subdued">
-                    Multiplied by <code>custom.gold_weight</code> on each
-                    product/variant.
-                  </s-text>
-                  <s-grid>
-                    {metalFields.map((f) => (
-                      <s-grid-item key={f.key}>
-                        <RateField
-                          fieldKey={f.key}
-                          label={f.label}
-                          unit={f.unit}
-                          value={form[f.key]}
-                          error={actionData?.errors?.[f.key]}
-                          onChange={handleChange}
-                        />
-                      </s-grid-item>
-                    ))}
-                  </s-grid>
-                </s-stack>
-              </s-box>
-
-              <s-box
-                padding="base"
-                background="base"
-                border-width="base"
-                border-color="base"
-                border-radius="base"
-              >
-                <s-stack direction="block" gap="base">
-                  <s-heading>Diamond rates (₹ per carat)</s-heading>
-                  <s-text tone="subdued">
-                    Multiplied by <code>custom.diamond_weight</code> on each
-                    product/variant.
-                  </s-text>
-                  <s-grid>
-                    {diamondFields.map((f) => (
-                      <s-grid-item key={f.key}>
-                        <RateField
-                          fieldKey={f.key}
-                          label={f.label}
-                          unit={f.unit}
-                          value={form[f.key]}
-                          error={actionData?.errors?.[f.key]}
-                          onChange={handleChange}
-                        />
-                      </s-grid-item>
-                    ))}
-                  </s-grid>
-                </s-stack>
-              </s-box>
-            </s-stack>
+            <s-box
+              padding="base"
+              background="base"
+              border-width="base"
+              border-color="base"
+              border-radius="base"
+            >
+              <s-stack direction="block" gap="base">
+                <s-heading>Metal rates (₹ per gram)</s-heading>
+                <s-text tone="subdued">
+                  Multiplied by <code>custom.gold_weight</code> on each
+                  product/variant.
+                </s-text>
+                <s-grid>
+                  {FIELDS.map((f) => (
+                    <s-grid-item key={f.key}>
+                      <RateField
+                        fieldKey={f.key}
+                        label={f.label}
+                        unit={f.unit}
+                        value={form[f.key]}
+                        error={actionData?.errors?.[f.key]}
+                        onChange={handleChange}
+                      />
+                    </s-grid-item>
+                  ))}
+                </s-grid>
+              </s-stack>
+            </s-box>
           </s-grid-item>
 
-          {/* ── Right: formula + preview ── */}
+          {/* ── Right: formula preview + metafield reference ── */}
           <s-grid-item>
             <s-stack direction="block" gap="base">
               <s-box
@@ -651,22 +608,14 @@ export default function RatesPage() {
                     </thead>
                     <tbody>
                       {[
-                        {
-                          key: "custom.gold_weight",
-                          on: "Product or Variant",
-                        },
-                        {
-                          key: "custom.diamond_weight",
-                          on: "Product or Variant",
-                        },
-                        {
-                          key: "custom.stone_price",
-                          on: "Product or Variant",
-                        },
+                        { key: "custom.gold_weight", on: "Product or Variant" },
+                        { key: "custom.stone_price", on: "Product or Variant" },
                         {
                           key: "custom.making_charges",
                           on: "Product or Variant",
                         },
+                        { key: "custom.natural_diamond", on: "Product" },
+                        { key: "custom.lab_grown_diamond", on: "Product" },
                       ].map(({ key, on }) => (
                         <tr key={key}>
                           <td style={tbl.td}>
@@ -693,61 +642,62 @@ export default function RatesPage() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SUB-COMPONENT — formula preview with example weights
+// SUB-COMPONENT — formula preview with example values
 // ─────────────────────────────────────────────────────────────────────────────
 function FormulaPreview({ form }) {
   const g = (k) => Math.max(0, parseFloat(form[k]) || 0);
 
-  // Example: 5g ring + 0.25ct diamond + ₹500 stone price + 15% making charge
-  const METAL_WEIGHT = 5;
-  const DIAMOND_CARAT = 0.25;
-  const STONE_PRICE = 500;
-  const MAKING = 15; // percent
+  // Example values (what you'd set on a product's metafields)
+  const METAL_WEIGHT = 5; // custom.gold_weight
+  const STONE_PRICE = 500; // custom.stone_price
+  const MAKING = 15; // custom.making_charges (%)
+  const NAT_DIA_PRICE = 8000; // custom.natural_diamond (flat ₹)
+  const LAB_DIA_PRICE = 3000; // custom.lab_grown_diamond (flat ₹)
 
   const combos = [
     {
       metal: "18K Gold",
       mRate: g("gold18k"),
       dLabel: "Natural",
-      dRate: g("diaNat"),
+      dFlat: NAT_DIA_PRICE,
     },
     {
       metal: "18K Gold",
       mRate: g("gold18k"),
       dLabel: "Lab-grown",
-      dRate: g("diaLab"),
+      dFlat: LAB_DIA_PRICE,
     },
     {
       metal: "14K Gold",
       mRate: g("gold14k"),
       dLabel: "Natural",
-      dRate: g("diaNat"),
+      dFlat: NAT_DIA_PRICE,
     },
     {
       metal: "14K Gold",
       mRate: g("gold14k"),
       dLabel: "Lab-grown",
-      dRate: g("diaLab"),
+      dFlat: LAB_DIA_PRICE,
     },
     {
       metal: "9K Gold",
       mRate: g("gold9k"),
       dLabel: "Natural",
-      dRate: g("diaNat"),
+      dFlat: NAT_DIA_PRICE,
     },
     {
       metal: "9K Gold",
       mRate: g("gold9k"),
       dLabel: "Lab-grown",
-      dRate: g("diaLab"),
+      dFlat: LAB_DIA_PRICE,
     },
   ];
 
   return (
     <>
       <s-text tone="subdued">
-        Example: {METAL_WEIGHT}g metal · {DIAMOND_CARAT}ct diamond · ₹
-        {STONE_PRICE} stone · {MAKING}% making
+        Example: {METAL_WEIGHT}g · nat ₹{NAT_DIA_PRICE} / lab ₹{LAB_DIA_PRICE}{" "}
+        diamond · ₹{STONE_PRICE} stone · {MAKING}% making
       </s-text>
       <table style={tbl.table}>
         <thead>
@@ -757,9 +707,8 @@ function FormulaPreview({ form }) {
           </tr>
         </thead>
         <tbody>
-          {combos.map(({ metal, mRate, dLabel, dRate }) => {
-            const base =
-              METAL_WEIGHT * mRate + DIAMOND_CARAT * dRate + STONE_PRICE;
+          {combos.map(({ metal, mRate, dLabel, dFlat }) => {
+            const base = METAL_WEIGHT * mRate + dFlat + STONE_PRICE;
             const price = base * (1 + MAKING / 100);
             return (
               <tr key={metal + dLabel}>
